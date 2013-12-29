@@ -38,20 +38,16 @@
 #define printf(...) printf("[BL] " __VA_ARGS__)
 
 /********************************* Context *********************************/
-// Variables also used by callbacks
-GAttrib       *attrib        = NULL;
-GIOChannel    *iochannel     = NULL;
-int            opt_mtu       = 0;
-
-static char   *opt_src       = NULL;
-static char   *opt_dst       = NULL;
-static char   *opt_dst_type  = NULL;
-static char   *opt_sec_level = NULL;
-static int     opt_psm       = 0;
-static char   *current_mac   = NULL;
-
-// Avoid two functions running at the same time
-static GMutex *bluelib_mutex = NULL;
+       GAttrib    *attrib        = NULL; // Useful for notif.c
+static GIOChannel *iochannel     = NULL;
+static int         opt_mtu       = 0;
+static char       *opt_src       = NULL;
+static char       *opt_dst       = NULL;
+static char       *opt_dst_type  = NULL;
+static char       *opt_sec_level = NULL;
+static int         opt_psm       = 0;
+static char       *current_mac   = NULL;
+static int         bluelib_init  = 0;
 
 // User specific callback;
 user_cb_fct_t *connect_cb_fct = NULL;
@@ -104,12 +100,10 @@ static inline int handle_assert(uint16_t *start_handle, uint16_t *end_handle,
   // Default range
   *start_handle = 0x0001;
   *end_handle   = 0xffff;
-  end_handle_cb = 0xffff;
 
   if (bl_primary != NULL) {
     *start_handle = bl_primary->start_handle;
     *end_handle   = bl_primary->end_handle;
-    end_handle_cb = bl_primary->end_handle;
   }
 
   if (start_handle > end_handle) {
@@ -130,20 +124,18 @@ static inline int handle_assert(uint16_t *start_handle, uint16_t *end_handle,
 }
 
 #define BLUELIB_ENTER                                   \
-  if (bluelib_mutex == NULL){                           \
+  if (bluelib_init == 0) {                              \
     return BL_NOT_INIT_ERROR;                           \
-  }                                                     \
-g_mutex_lock(bluelib_mutex)
+  }
 
 #define BLUELIB_ENTER_GERR                              \
-  if (bluelib_mutex == NULL){                           \
+  if (bluelib_init == 0) {                              \
     GError *err = g_error_new(BL_ERROR_DOMAIN,          \
         BL_NOT_INIT_ERROR,                              \
         "Bluelib not initialised\n");                   \
     PROPAGATE_ERROR;                                    \
     return NULL;                                        \
-  }                                                     \
-g_mutex_lock(bluelib_mutex)
+  }
 
 #define ASSERT_CONNECTED                                \
   if (get_conn_state() != STATE_CONNECTED) {            \
@@ -173,10 +165,6 @@ g_mutex_lock(bluelib_mutex)
     goto exit;                                          \
   }
 
-#define BLUELIB_EXIT                                    \
-  g_mutex_unlock(bluelib_mutex);                        \
-  return ret
-
 
 /***************************** Global functions ****************************/
 
@@ -198,10 +186,7 @@ int bl_init(const char *src, const char *dst, const char *dst_type, int psm,
   else
     opt_sec_level = g_strdup("low");
 
-  bluelib_mutex = malloc(sizeof(GMutex));
-  if (!bluelib_mutex)
-    return -1;
-  g_mutex_init(bluelib_mutex);
+  bluelib_init = 1;
   return BL_NO_ERROR;
 }
 
@@ -210,21 +195,25 @@ int bl_init(const char *src, const char *dst, const char *dst_type, int psm,
 // Connect to a device
 int bl_connect(char *mac_dst, char *dst_type)
 {
+  conn_cb_ctx_t conn_cb_ctx;
   GError *gerr = NULL;
   int ret;
-
   BLUELIB_ENTER;
+
+  CB_CTX_INIT(conn_cb_ctx.cb_ctx, &gerr);
+  conn_cb_ctx.attrib    = attrib;
+  conn_cb_ctx.iochannel = iochannel;
 
   if (get_conn_state() != STATE_DISCONNECTED) {
     printf("Error: Already connected to a device\n");
     ret = BL_ALREADY_CONNECTED_ERROR;
-    goto error;
+    return ret;
   }
 
   if (!mac_dst) {
     printf("Error: Remote Bluetooth address required\n");
     ret = EINVAL;
-    goto error;
+    return ret;
   }
 
   // Check if the address MAC is correct
@@ -253,21 +242,20 @@ int bl_connect(char *mac_dst, char *dst_type)
   printf("Attempting to connect to %s\n", opt_dst);
   set_conn_state(STATE_CONNECTING);
   iochannel = gatt_connect(opt_src, opt_dst, opt_dst_type, opt_sec_level,
-                           opt_psm, opt_mtu, connect_cb, &gerr);
+                           opt_psm, opt_mtu, connect_cb, &gerr, &conn_cb_ctx);
 
   if (gerr) {
-    printf("Error <%d %s>\n", gerr->code, gerr->message);
     set_conn_state(STATE_DISCONNECTED);
     ret = gerr->code;
     g_error_free(gerr);
-    goto error;
+    return ret;
   }
 
   if (!iochannel) {
     printf("Error: iochannel NULL\n");
     set_conn_state(STATE_DISCONNECTED);
     ret = BL_SEND_REQUEST_ERROR;
-    goto error;
+    return ret;
   }
 
   g_io_add_watch(iochannel, G_IO_HUP, channel_watcher, NULL);
@@ -275,29 +263,34 @@ int bl_connect(char *mac_dst, char *dst_type)
   if (start_event_loop(&gerr)) {
     printf("Error: fail to start event loop\n");
     set_conn_state(STATE_DISCONNECTED);
-    goto error;
+    ret = BL_DISCONNECTED_ERROR;
+    return ret;
   }
 
-  ret = wait_for_cb(NULL, NULL);
+  ret = wait_for_cb(&conn_cb_ctx.cb_ctx);
   if (ret) {
     printf("Error: CallBack error\n");
     set_conn_state(STATE_DISCONNECTED);
     stop_event_loop();
-    goto error;
+    return ret;
+  }
+
+  if (*conn_cb_ctx.cb_ctx.gerr) {
+    ret = (*conn_cb_ctx.cb_ctx.gerr)->code;
+    g_error_free(*conn_cb_ctx.cb_ctx.gerr);
+    return ret;
   }
 
   current_mac = mac_dst;
   ret = BL_NO_ERROR;
-  g_mutex_unlock(bluelib_mutex);
   if (connect_cb_fct)
-    return connect_cb_fct();
+    ret = connect_cb_fct();
   return ret;
 
 wrongmac:
   printf("Error: Address MAC invalid\n");
   ret = EINVAL;
-error:
-  BLUELIB_EXIT;
+  return ret;
 }
 
 // Disconnect from the device, delete the nofication list.
@@ -311,7 +304,7 @@ int bl_disconnect(void)
   printf("Disconnected\n");
   if (is_event_loop_running())
     stop_event_loop();
-  BLUELIB_EXIT;
+  return ret;
 }
 
 // Set a function to call each time you succeed to connect
@@ -329,37 +322,41 @@ int bl_set_connect_cb(user_cb_fct_t func)
 // Return a list of primary services (bl_primary_t *).
 GSList *bl_get_all_primary(char *uuid_str, GError **gerr)
 {
-  GSList *ret = NULL;
+  cb_ctx_t cb_ctx;
+  GSList *ret;
 
   CLEAR_GERROR;
   BLUELIB_ENTER_GERR;
   ASSERT_CONNECTED_GERR;
 
+  CB_CTX_INIT(cb_ctx, gerr);
+
   if (uuid_str) {
     bt_uuid_t uuid;
     bt_string_to_uuid(&uuid, uuid_str);
-    if (!gatt_discover_primary(attrib, &uuid, primary_by_uuid_cb, NULL)) {
+    if (!gatt_discover_primary(attrib, &uuid, primary_by_uuid_cb, &cb_ctx)) {
       GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
       PROPAGATE_ERROR;
       goto exit;
     }
-  } else if (!gatt_discover_primary(attrib, NULL, primary_all_cb, NULL)) {
+  } else if (!gatt_discover_primary(attrib, NULL, primary_all_cb, &cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
 
-  if (wait_for_cb((void **) &ret, gerr))
+  if (wait_for_cb(&cb_ctx));
     goto exit;
-  if ((ret != NULL) && (uuid_str)) {
+  if ((cb_ctx.p_ret != NULL) && (uuid_str)) {
     // Add uuid to each bl_primary of the list
-    for (GSList *l = ret; l; l = l->next)
+    for (GSList *l = cb_ctx.p_ret; l; l = l->next)
       strcpy(((bl_primary_t *)(l->data))->uuid_str, uuid_str);
   }
 exit:
-  BLUELIB_EXIT;
+  ret = cb_ctx.p_ret;
+  return ret;
 }
 
 // Get a specific primary service.
@@ -400,11 +397,13 @@ GSList *bl_get_all_primary_device(GError **gerr)
 // Returns a list of included services (bl_included_t *).
 GSList *bl_get_included(bl_primary_t *bl_primary, GError **gerr)
 {
-  GSList *ret = NULL;
+  cb_ctx_t  cb_ctx;
+  GSList   *ret;
 
   CLEAR_GERROR;
   BLUELIB_ENTER_GERR;
   ASSERT_CONNECTED_GERR;
+  CB_CTX_INIT(cb_ctx, gerr);
 
   // Initialisation to default range.
   uint16_t start_handle = 0x0001;
@@ -414,16 +413,17 @@ GSList *bl_get_included(bl_primary_t *bl_primary, GError **gerr)
     goto exit;
 
   if (!gatt_find_included(attrib, start_handle, end_handle, included_cb,
-        NULL)) {
+        &cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
 
-  wait_for_cb((void **) &ret, gerr);
+  wait_for_cb(&cb_ctx);
 exit:
-  BLUELIB_EXIT;
+  ret = cb_ctx.p_ret;
+  return ret;
 }
 
 
@@ -433,11 +433,13 @@ exit:
 GSList *bl_get_all_char(char *uuid_str, bl_primary_t *bl_primary,
     GError **gerr)
 {
-  GSList *ret = NULL;
+  cb_ctx_t cb_ctx;
+  GSList *ret;
 
   CLEAR_GERROR;
   BLUELIB_ENTER_GERR;
   ASSERT_CONNECTED_GERR;
+  CB_CTX_INIT(cb_ctx, gerr);
 
   // Intialisation to default range.
   uint16_t start_handle;
@@ -455,16 +457,17 @@ GSList *bl_get_all_char(char *uuid_str, bl_primary_t *bl_primary,
   }
 
   if (!gatt_discover_char(attrib, start_handle, end_handle, puuid,
-        char_by_uuid_cb, NULL)) {
+        char_by_uuid_cb, &cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
 
-  wait_for_cb((void **) &ret, gerr);
+  wait_for_cb(&cb_ctx);
 exit:
-  BLUELIB_EXIT;
+  ret = cb_ctx.p_ret;
+  return ret;
 }
 
 // Get a specific characteristic associated to an UUID on a primary service.
@@ -511,11 +514,16 @@ GSList *bl_get_all_char_in_primary(bl_primary_t *bl_primary, GError **gerr)
 GSList *bl_get_all_desc_by_char(bl_char_t *start_bl_char,
     bl_char_t *end_bl_char, bl_primary_t *bl_primary, GError **gerr)
 {
-  GSList   *ret = NULL;
+  char_desc_cb_ctx_t  cd_cb_ctx;
+  GSList   *ret;
   uint16_t  start_handle;
   uint16_t  end_handle;
 
   CLEAR_GERROR;
+  CB_CTX_INIT(cd_cb_ctx.cb_ctx, gerr);
+  cd_cb_ctx.bl_desc_list = NULL;
+  cd_cb_ctx.attrib = attrib;
+
   BLUELIB_ENTER_GERR;
   ASSERT_CONNECTED_GERR;
 
@@ -544,16 +552,19 @@ GSList *bl_get_all_desc_by_char(bl_char_t *start_bl_char,
     PROPAGATE_ERROR;
     goto exit;
   }
+
+  cd_cb_ctx.end_handle = end_handle;
   if (!gatt_discover_char_desc(attrib, start_handle, end_handle,
-        char_desc_cb, NULL)) {
+        char_desc_cb, &cd_cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
-  wait_for_cb((void **) &ret, gerr);
+  wait_for_cb(&cd_cb_ctx.cb_ctx);
 exit:
-  BLUELIB_EXIT;
+  ret = cd_cb_ctx.cb_ctx.p_ret;
+  return ret;
 }
 
 // Get all the descriptors of the unique characteristic associated to the
@@ -648,10 +659,12 @@ bl_desc_t *bl_get_desc(char *char_uuid_str, bl_primary_t *bl_primary,
 // Read by handle.
 static bl_value_t *read_by_hnd(uint16_t handle, GError **gerr)
 {
-  bl_value_t *ret = NULL;
+  cb_ctx_t cb_ctx;
+  bl_value_t *ret;
   *gerr = NULL;
 
   BLUELIB_ENTER_GERR;
+  CB_CTX_INIT(cb_ctx, gerr);
   ASSERT_CONNECTED_GERR;
 
   if (handle == INVALID_HANDLE) {
@@ -661,29 +674,32 @@ static bl_value_t *read_by_hnd(uint16_t handle, GError **gerr)
     goto exit;
   }
 
-  if (!gatt_read_char(attrib, handle, read_by_hnd_cb, attrib)) {
+  if (!gatt_read_char(attrib, handle, read_by_hnd_cb, &cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
 
-  wait_for_cb((void **) &ret, gerr);
+  wait_for_cb(&cb_ctx);
 
   // Add handle to the value
-  if (ret)
-    ret->handle = handle;
+  if (cb_ctx.p_ret)
+    ((bl_value_t *)cb_ctx.p_ret)->handle = handle;
 exit:
-  BLUELIB_EXIT;
+  ret = cb_ctx.p_ret;
+  return ret;
 }
 
 // Read all the characteristics value associated to this UUID.
 // Return a list of values (bl_value_t *).
 GSList *bl_read_char_all(char *uuid_str, bl_primary_t *bl_primary, GError **gerr)
 {
+  cb_ctx_t cb_ctx;
   GSList *ret = NULL;
 
   BLUELIB_ENTER_GERR;
+  CB_CTX_INIT(cb_ctx, gerr);
   ASSERT_CONNECTED_GERR;
 
   if (uuid_str == NULL) {
@@ -704,23 +720,24 @@ GSList *bl_read_char_all(char *uuid_str, bl_primary_t *bl_primary, GError **gerr
   bt_string_to_uuid(&uuid, uuid_str);
 
   if (!gatt_read_char_by_uuid(attrib, start_handle, end_handle, &uuid,
-                              read_by_uuid_cb, NULL)) {
+                              read_by_uuid_cb, &cb_ctx)) {
     GError *err = g_error_new(BL_ERROR_DOMAIN, BL_SEND_REQUEST_ERROR,
         "Unable to send request\n");
     PROPAGATE_ERROR;
     goto exit;
   }
 
-  wait_for_cb((void **) &ret, gerr);
+  wait_for_cb(&cb_ctx);
 
-  if (ret) {
+  if (cb_ctx.p_ret) {
     // Add the value of the UUID to each of the values
-    for (GSList *l = ret; l; l = l->next) {
+    for (GSList *l = cb_ctx.p_ret; l; l = l->next) {
       strcpy(((bl_value_t *)(l->data))->uuid_str, uuid_str);
     }
   }
 exit:
-  BLUELIB_EXIT;
+  ret = cb_ctx.p_ret;
+  return ret;
 }
 
 // Read a characteristic value by UUID on a primary service.
@@ -854,10 +871,10 @@ bl_value_t *bl_read_desc_by_char(bl_char_t *start_bl_char,
 
 /************************ Write characteristic value ***********************/
 // Write a characteristic by handle.
-static int write_by_hnd(uint16_t handle, uint8_t *value, size_t size, int type)
+static int write_by_hnd(uint16_t handle, uint8_t *value, size_t size,
+                        int type)
 {
   int ret;
-
   BLUELIB_ENTER;
   ASSERT_CONNECTED;
 
@@ -874,13 +891,20 @@ static int write_by_hnd(uint16_t handle, uint8_t *value, size_t size, int type)
   }
 
   if (type) {
+    GError *gerr = NULL;
+    cb_ctx_t cb_ctx;
+    CB_CTX_INIT(cb_ctx, &gerr);
     if (!gatt_write_char(attrib, handle, value, size, write_req_cb,
-                         NULL)) {
+                         &cb_ctx)) {
       printf("Error: Unable to send request\n");
       ret = BL_SEND_REQUEST_ERROR;
       goto exit;
     }
-    ret = wait_for_cb(NULL, NULL);
+    ret = wait_for_cb(&cb_ctx);
+    if (*cb_ctx.gerr != NULL) {
+      ret = (*cb_ctx.gerr)->code;
+      g_error_free(*cb_ctx.gerr);
+    }
   } else {
     if (!gatt_write_cmd(attrib, handle, value, size, NULL, NULL)) {
       printf("Error: Unable to send write cmd\n");
@@ -891,7 +915,7 @@ static int write_by_hnd(uint16_t handle, uint8_t *value, size_t size, int type)
   }
 
 exit:
-  BLUELIB_EXIT;
+  return ret;
 }
 
 // Write a characteristic value by UUID on a primary service
@@ -1021,22 +1045,28 @@ int bl_change_sec_level(int level)
   }
   ret = BL_NO_ERROR;
 exit:
-  BLUELIB_EXIT;
+  return ret;
 }
 
 
 /************************* Change MTU for GATT/ATT *************************/
-int bl_change_mtu(int value)
+int bl_change_mtu(int *mtu_value)
 {
+  mtu_cb_ctx_t  mtu_cb_ctx;
+  GError   *gerr = NULL;
   int ret;
 
   BLUELIB_ENTER;
+  CB_CTX_INIT(mtu_cb_ctx.cb_ctx, &gerr);
   ASSERT_CONNECTED;
+  mtu_cb_ctx.mtu     = *mtu_value;
+  mtu_cb_ctx.opt_mtu = opt_mtu;
+  mtu_cb_ctx.attrib = attrib;
 
   if (opt_psm) {
     printf("Error: Operation is only available for LE transport.\n");
     ret = BL_LE_ONLY_ERROR;
-  goto exit;
+    goto exit;
   }
 
   if (opt_mtu) {
@@ -1046,16 +1076,17 @@ int bl_change_mtu(int value)
   }
 
   errno = 0;
-  opt_mtu = value;
+  opt_mtu = *mtu_value;
   if (errno != 0 || opt_mtu < ATT_DEFAULT_LE_MTU) {
     printf("Error: Invalid value. Minimum MTU size is %d\n",
         ATT_DEFAULT_LE_MTU);
     ret = EINVAL;
     goto exit;
   }
-  gatt_exchange_mtu(attrib, opt_mtu, exchange_mtu_cb, NULL);
+  gatt_exchange_mtu(attrib, opt_mtu, exchange_mtu_cb, &mtu_cb_ctx);
 
-  ret = wait_for_cb(NULL, NULL);
+  ret = wait_for_cb(&mtu_cb_ctx.cb_ctx);
+  *mtu_value = mtu_cb_ctx.mtu;
 exit:
-  BLUELIB_EXIT;
+  return ret;
 }

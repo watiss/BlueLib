@@ -30,11 +30,52 @@ int  start_event_loop(GError **gerr);
 void stop_event_loop(void);
 int  is_event_loop_running(void);
 
-// Block the main thread while waiting for the callback
-int wait_for_cb(void **ret_pointer, GError **gerr);
+// Callback global context
+// GError points to Null if no error else it's allocated
+typedef struct {
+  GMutex   cb_mutex;
+  void    *p_ret;
+  GError **gerr;
+} cb_ctx_t;
 
-// Shared variable
-extern uint16_t end_handle_cb;
+// Use this function before using in call user data.
+#define CB_CTX_INIT(cb_ctx, pp_gerr)      \
+  do {                                    \
+    memset(&cb_ctx, 0, sizeof(cb_ctx_t)); \
+    /* Be sure to alloc an unlock mutex*/ \
+    g_mutex_unlock(&cb_ctx.cb_mutex);     \
+    g_mutex_lock(&cb_ctx.cb_mutex);       \
+    cb_ctx.gerr = pp_gerr;                \
+    if (cb_ctx.gerr && *cb_ctx.gerr) {    \
+      g_error_free(*cb_ctx.gerr);         \
+      *cb_ctx.gerr = NULL;                \
+    }                                     \
+  } while (0)
+
+// Callbacks specific contexts
+typedef struct {
+  cb_ctx_t    cb_ctx;
+  GAttrib    *attrib;
+  GIOChannel *iochannel;
+} conn_cb_ctx_t;
+
+typedef struct {
+  cb_ctx_t   cb_ctx;
+  uint16_t   end_handle;
+  GSList    *bl_desc_list;
+  GAttrib   *attrib;
+} char_desc_cb_ctx_t;
+
+typedef struct {
+  cb_ctx_t cb_ctx;
+  uint16_t mtu;
+  int      opt_mtu;
+  GAttrib *attrib;
+} mtu_cb_ctx_t;
+
+// Block the calling thread while waiting for the callback
+int wait_for_cb(cb_ctx_t *ctx);
+
 // Callbacks
 void connect_cb(GIOChannel *io, GError *err, gpointer user_data);
 void primary_all_cb(GSList *services, guint8 status,

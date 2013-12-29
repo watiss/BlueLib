@@ -279,7 +279,8 @@ int bl_change_sec_level(int level);
 
 
 /************************* Change MTU for GATT/ATT *************************/
-int bl_change_mtu(int value);
+// The MTU selected is returned in mtu_value.
+int bl_change_mtu(int *mtu_value);
 
 
 /****************************** Notifications *******************************
